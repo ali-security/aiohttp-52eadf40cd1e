@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import sys
 import zlib
+from typing import Optional
 from unittest import mock
 
 import pytest
@@ -22,6 +23,7 @@ from aiohttp.hdrs import (
     CONTENT_TYPE,
 )
 from aiohttp.helpers import parse_mimetype
+from aiohttp.http_exceptions import BadHttpMessage, LineTooLong
 from aiohttp.multipart import (
     BodyPartReader,
     BodyPartReaderPayload,
@@ -88,7 +90,7 @@ class Stream:
     def at_eof(self):
         return self.content.tell() == len(self.content.getbuffer())
 
-    async def readline(self):
+    async def readline(self, *, max_line_length: Optional[int] = None) -> bytes:
         return self.content.readline()
 
     def unread_data(self, data):
@@ -821,6 +823,53 @@ class TestMultipartReader:
             with pytest.raises(ValueError):
                 await reader.next()
 
+    @staticmethod
+    def _make_limited_reader(
+        part_headers: bytes, **kwargs: int
+    ) -> aiohttp.MultipartReader:
+        stream = StreamReader(
+            mock.Mock(_reading_paused=False), 2**16, loop=asyncio.get_running_loop()
+        )
+        stream.feed_data(b"--:\r\n" + part_headers + b"\r\nbody\r\n--:--\r\n")
+        stream.feed_eof()
+        return aiohttp.MultipartReader(
+            {CONTENT_TYPE: 'multipart/related;boundary=":"'}, stream, **kwargs
+        )
+
+    async def test_read_headers_max_headers(self) -> None:
+        # CVE-2026-34516: the number of headers in a part is bounded.
+        allowed = b"".join(b"X-%d: a\r\n" % i for i in range(4))
+        reader = self._make_limited_reader(allowed, max_headers=4)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert len(part.headers) == 4
+
+        too_many = b"".join(b"X-%d: a\r\n" % i for i in range(5))
+        reader = self._make_limited_reader(too_many, max_headers=4)
+        with pytest.raises(BadHttpMessage, match="Too many headers received"):
+            await reader.next()
+
+    async def test_read_headers_default_max_headers(self) -> None:
+        many = b"".join(b"X-%d: a\r\n" % i for i in range(129))
+        reader = self._make_limited_reader(many)
+        with pytest.raises(BadHttpMessage, match="Too many headers received"):
+            await reader.next()
+
+    async def test_read_headers_max_field_size(self) -> None:
+        # CVE-2026-34516: a single header line is bounded by max_field_size
+        # instead of the (much larger) stream buffer limit.
+        # The limit covers the whole line including the trailing CRLF.
+        line = b"X-Long: " + b"a" * 90 + b"\r\n"
+        reader = self._make_limited_reader(line, max_field_size=100)
+        part = await reader.next()
+        assert isinstance(part, BodyPartReader)
+        assert part.headers["X-Long"] == "a" * 90
+
+        line = b"X-Long: " + b"a" * 100 + b"\r\n"
+        reader = self._make_limited_reader(line, max_field_size=100)
+        with pytest.raises(LineTooLong, match="Got more than 100 bytes"):
+            await reader.next()
+
     @pytest.mark.skipif(sys.version_info < (3, 10), reason="Needs anext()")
     async def test_read_boundary_across_chunks(self) -> None:
         class SplitBoundaryStream:
@@ -845,7 +894,7 @@ class TestMultipartReader:
             def at_eof(self) -> bool:
                 return not self.content
 
-            async def readline(self) -> bytes:
+            async def readline(self, *, max_line_length: Optional[int] = None) -> bytes:
                 line = b""
                 while self.content and b"\n" not in line:
                     line += self.content.pop(0)
