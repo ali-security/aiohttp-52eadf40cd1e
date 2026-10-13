@@ -12,7 +12,11 @@ from typing import List, Optional, Sequence, Tuple, cast
 
 from .log import internal_logger
 
-__all__ = ("parse_cookie_headers", "preserve_morsel_with_coded_value")
+__all__ = (
+    "parse_cookie_header",
+    "parse_cookie_headers",
+    "preserve_morsel_with_coded_value",
+)
 
 # Cookie parsing constants
 # Allow more characters in cookie names to handle real-world cookies
@@ -143,6 +147,37 @@ def parse_cookie_headers(headers: Sequence[str]) -> List[Tuple[str, Morsel[str]]
     This implementation handles unmatched quotes more gracefully to prevent cookie loss.
     See https://github.com/aio-libs/aiohttp/issues/7993
     """
+    return _parse_cookie_headers(headers)
+
+
+def parse_cookie_header(header: str) -> List[Tuple[str, Morsel[str]]]:
+    """
+    Parse a Cookie header sent by a client in a request.
+
+    Uses the same lenient parsing as parse_cookie_headers, but illegal cookie
+    names are collected and reported in a single debug log record instead of
+    one warning per name, so a crafted header cannot flood the logs.
+    """
+    invalid_names: List[str] = []
+    cookies = _parse_cookie_headers((header,), invalid_names)
+
+    if invalid_names:
+        internal_logger.debug(
+            "Cannot load cookie. Illegal cookie names: %r", invalid_names
+        )
+
+    return cookies
+
+
+def _parse_cookie_headers(
+    headers: Sequence[str], invalid_names: Optional[List[str]] = None
+) -> List[Tuple[str, Morsel[str]]]:
+    """
+    Parse cookie headers, see parse_cookie_headers.
+
+    When invalid_names is given, illegal cookie names are appended to it
+    instead of being logged one by one.
+    """
     parsed_cookies: List[Tuple[str, Morsel[str]]] = []
 
     for header in headers:
@@ -197,9 +232,12 @@ def parse_cookie_headers(headers: Sequence[str]) -> List[Tuple[str, Morsel[str]]
                 # This is a cookie name=value pair
                 # Validate the name
                 if key in _COOKIE_KNOWN_ATTRS or not _COOKIE_NAME_RE.match(key):
-                    internal_logger.warning(
-                        "Can not load cookies: Illegal cookie name %r", key
-                    )
+                    if invalid_names is not None:
+                        invalid_names.append(key)
+                    else:
+                        internal_logger.warning(
+                            "Can not load cookies: Illegal cookie name %r", key
+                        )
                     current_morsel = None
                 else:
                     # Create new morsel

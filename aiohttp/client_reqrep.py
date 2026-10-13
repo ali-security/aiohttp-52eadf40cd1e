@@ -31,7 +31,11 @@ from multidict import CIMultiDict, CIMultiDictProxy, MultiDict, MultiDictProxy
 from yarl import URL
 
 from . import hdrs, helpers, http, multipart, payload
-from ._cookie_helpers import parse_cookie_headers, preserve_morsel_with_coded_value
+from ._cookie_helpers import (
+    parse_cookie_header,
+    parse_cookie_headers,
+    preserve_morsel_with_coded_value,
+)
 from .abc import AbstractStreamWriter
 from .client_exceptions import (
     ClientConnectionError,
@@ -1093,8 +1097,8 @@ class ClientRequest:
 
         c = SimpleCookie()
         if hdrs.COOKIE in self.headers:
-            # parse_cookie_headers already preserves coded values
-            c.update(parse_cookie_headers((self.headers.get(hdrs.COOKIE, ""),)))
+            # parse_cookie_header already preserves coded values
+            c.update(parse_cookie_header(self.headers.get(hdrs.COOKIE, "")))
             del self.headers[hdrs.COOKIE]
 
         if isinstance(cookies, Mapping):

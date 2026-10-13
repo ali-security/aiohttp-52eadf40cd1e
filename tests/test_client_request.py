@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import io
+import logging
 import pathlib
 import sys
 import urllib.parse
@@ -663,6 +664,27 @@ def test_update_cookies_with_quoted_existing_header(
         req.headers["COOKIE"]
         == 'new_cookie=new_value; session="value;with;semicolon"; token=abc123'
     )
+
+
+def test_update_cookies_many_invalid_existing_header(
+    loop: asyncio.AbstractEventLoop, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test many invalid names in an existing Cookie header log only once."""
+    bad = "bad" + chr(44) + "name"
+    cookie = "; ".join(f"{bad}{i}=1" for i in range(3000))
+    req = ClientRequest(
+        "get", URL("http://python.org"), headers={"Cookie": cookie}, loop=loop
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="aiohttp.internal"):
+        req.update_cookies(cookies={"good": "value"})
+
+    records = [r for r in caplog.record_tuples if r[0] == "aiohttp.internal"]
+    assert len(records) == 1
+    _, level, msg = records[0]
+    assert level == logging.DEBUG
+    assert "Cannot load cookie. Illegal cookie names" in msg
+    assert req.headers["COOKIE"] == "good=value"
 
 
 async def test_connection_header(
