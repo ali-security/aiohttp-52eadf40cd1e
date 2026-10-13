@@ -1,8 +1,10 @@
 import os
 import pathlib
 import sys
+from multiprocessing.pool import ThreadPool
 
 from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
 
 if sys.version_info < (3, 9):
     raise RuntimeError("aiohttp 3.x requires Python 3.9+")
@@ -14,9 +16,10 @@ USE_SYSTEM_DEPS = bool(
 NO_EXTENSIONS: bool = bool(os.environ.get("AIOHTTP_NO_EXTENSIONS"))
 HERE = pathlib.Path(__file__).parent
 IS_GIT_REPO = (HERE / ".git").exists()
+IS_CPYTHON = sys.implementation.name == "cpython"
 
 
-if sys.implementation.name != "cpython":
+if not IS_CPYTHON:
     NO_EXTENSIONS = True
 
 
@@ -54,6 +57,58 @@ else:
         "include_dirs": ["vendor/llhttp/build"],
     }
 
+
+# CVE-2025-69223: aiohttp ships a private copy of Brotli >= 1.2 under
+# ``aiohttp/_vendored`` so it can cap brotli decompression output WITHOUT
+# bumping the user's declared ``Brotli`` / ``brotlicffi`` requirement. The
+# compiled extension is a BUILD output -- the C source is vendored, the binary
+# is never committed. The C library sources + binding are copied verbatim from
+# Brotli 1.2.0 (``pip download --no-binary :all: Brotli==1.2.0``); only the
+# include path is repointed to the vendored tree.
+_BROTLI_VENDOR = "aiohttp/_vendored/brotli_src"
+_brotli_extension = Extension(
+    "aiohttp._vendored._brotli",
+    sources=[
+        f"{_BROTLI_VENDOR}/python/_brotli.c",
+        f"{_BROTLI_VENDOR}/c/common/constants.c",
+        f"{_BROTLI_VENDOR}/c/common/context.c",
+        f"{_BROTLI_VENDOR}/c/common/dictionary.c",
+        f"{_BROTLI_VENDOR}/c/common/platform.c",
+        f"{_BROTLI_VENDOR}/c/common/shared_dictionary.c",
+        f"{_BROTLI_VENDOR}/c/common/transform.c",
+        f"{_BROTLI_VENDOR}/c/dec/bit_reader.c",
+        f"{_BROTLI_VENDOR}/c/dec/decode.c",
+        f"{_BROTLI_VENDOR}/c/dec/huffman.c",
+        f"{_BROTLI_VENDOR}/c/dec/prefix.c",
+        f"{_BROTLI_VENDOR}/c/dec/state.c",
+        f"{_BROTLI_VENDOR}/c/dec/static_init.c",
+        f"{_BROTLI_VENDOR}/c/enc/backward_references.c",
+        f"{_BROTLI_VENDOR}/c/enc/backward_references_hq.c",
+        f"{_BROTLI_VENDOR}/c/enc/bit_cost.c",
+        f"{_BROTLI_VENDOR}/c/enc/block_splitter.c",
+        f"{_BROTLI_VENDOR}/c/enc/brotli_bit_stream.c",
+        f"{_BROTLI_VENDOR}/c/enc/cluster.c",
+        f"{_BROTLI_VENDOR}/c/enc/command.c",
+        f"{_BROTLI_VENDOR}/c/enc/compound_dictionary.c",
+        f"{_BROTLI_VENDOR}/c/enc/compress_fragment.c",
+        f"{_BROTLI_VENDOR}/c/enc/compress_fragment_two_pass.c",
+        f"{_BROTLI_VENDOR}/c/enc/dictionary_hash.c",
+        f"{_BROTLI_VENDOR}/c/enc/encode.c",
+        f"{_BROTLI_VENDOR}/c/enc/encoder_dict.c",
+        f"{_BROTLI_VENDOR}/c/enc/entropy_encode.c",
+        f"{_BROTLI_VENDOR}/c/enc/fast_log.c",
+        f"{_BROTLI_VENDOR}/c/enc/histogram.c",
+        f"{_BROTLI_VENDOR}/c/enc/literal_cost.c",
+        f"{_BROTLI_VENDOR}/c/enc/memory.c",
+        f"{_BROTLI_VENDOR}/c/enc/metablock.c",
+        f"{_BROTLI_VENDOR}/c/enc/static_dict.c",
+        f"{_BROTLI_VENDOR}/c/enc/static_dict_lut.c",
+        f"{_BROTLI_VENDOR}/c/enc/static_init.c",
+        f"{_BROTLI_VENDOR}/c/enc/utf8_util.c",
+    ],
+    include_dirs=[f"{_BROTLI_VENDOR}/c/include"],
+)
+
 extensions = [
     Extension("aiohttp._websocket.mask", ["aiohttp/_websocket/mask.c"]),
     Extension(
@@ -67,11 +122,119 @@ extensions = [
     ),
     Extension("aiohttp._http_writer", ["aiohttp/_http_writer.c"]),
     Extension("aiohttp._websocket.reader_c", ["aiohttp/_websocket/reader_c.c"]),
+    # The vendored CPython Brotli C extension. Cython exts may be disabled via
+    # AIOHTTP_NO_EXTENSIONS, but the brotli ext is the CVE fix delivery vehicle
+    # on CPython, so it is built whenever we are on CPython (see below).
+    _brotli_extension,
 ]
 
 
+# On PyPy the CPython C-API binding (python/_brotli.c) cannot be built; instead
+# vendored brotlicffi compiles against a static ``libbrotli`` via cffi, built from
+# the SAME shared Brotli C tree as the CPython extension. We mirror brotlicffi
+# 1.2.0.0's own build: a ``build_clib`` static library + a ``cffi_modules`` entry.
+# This path is wired best-effort (cannot be exercised on CPython).
+_BROTLICFFI_VENDOR = "aiohttp/_vendored/brotli_src"
+
+
+def _brotlicffi_clib_sources() -> list:
+    sources = []
+    for root, _dirs, filenames in os.walk(f"{_BROTLICFFI_VENDOR}/c"):
+        for filename in filenames:
+            if filename.endswith(".c"):
+                sources.append(os.path.join(root, filename))
+    return sorted(sources)
+
+
+class _ParallelCompileBuildExt(build_ext):
+    """``build_ext`` that compiles the sources of each extension in parallel.
+
+    CVE-2025-69223: the vendored Brotli extension carries ~36 C translation
+    units. ``[build_ext] parallel`` only overlaps whole extensions, so those
+    sources would still compile one by one, which overruns the time budget of
+    the QEMU-emulated wheel builds. Same compiler, same per-source arguments and
+    the same object order as ``CCompiler.compile``, so the linked result is
+    unchanged. Only applies to the ``unix`` compiler; MSVC overrides
+    ``compile()`` wholesale and is left untouched.
+    """
+
+    def build_extensions(self) -> None:
+        compiler = self.compiler
+        if compiler.compiler_type != "unix":
+            super().build_extensions()
+            return
+
+        workers = os.cpu_count() or 1
+
+        def _parallel_compile(
+            sources,
+            output_dir=None,
+            macros=None,
+            include_dirs=None,
+            debug=0,
+            extra_preargs=None,
+            extra_postargs=None,
+            depends=None,
+        ):
+            macros, objects, extra_postargs, pp_opts, build = (
+                compiler._setup_compile(
+                    output_dir, macros, include_dirs, sources, depends, extra_postargs
+                )
+            )
+            cc_args = compiler._get_cc_args(pp_opts, debug, extra_preargs)
+
+            def _compile_one(obj):
+                try:
+                    src, ext = build[obj]
+                except KeyError:
+                    return
+                compiler._compile(obj, src, ext, cc_args, extra_postargs, pp_opts)
+
+            if len(objects) < 2 or workers < 2:
+                for obj in objects:
+                    _compile_one(obj)
+            else:
+                with ThreadPool(min(workers, len(objects))) as pool:
+                    # Consume the iterator so a failed compile re-raises here.
+                    for _ in pool.imap_unordered(_compile_one, objects):
+                        pass
+            return objects
+
+        original_compile = compiler.compile
+        compiler.compile = _parallel_compile
+        try:
+            super().build_extensions()
+        finally:
+            compiler.compile = original_compile
+
+
 build_type = "Pure" if NO_EXTENSIONS else "Accelerated"
-setup_kwargs = {} if NO_EXTENSIONS else {"ext_modules": extensions}
+if IS_CPYTHON:
+    if NO_EXTENSIONS:
+        # Pure CPython build (AIOHTTP_NO_EXTENSIONS) still ships the brotli CVE
+        # fix as a compiled extension; the Cython accelerators are dropped.
+        setup_kwargs = {"ext_modules": [_brotli_extension]}
+    else:
+        setup_kwargs = {"ext_modules": extensions}
+    setup_kwargs["cmdclass"] = {"build_ext": _ParallelCompileBuildExt}
+else:
+    # PyPy: no CPython C-API extensions; only the cffi brotli backend.
+    setup_kwargs = {
+        "libraries": [
+            (
+                "libbrotli",
+                {
+                    "include_dirs": [
+                        f"{_BROTLICFFI_VENDOR}/c/include",
+                        f"{_BROTLICFFI_VENDOR}/c/common",
+                        f"{_BROTLICFFI_VENDOR}/c",
+                    ],
+                    "sources": _brotlicffi_clib_sources(),
+                },
+            ),
+        ],
+        "cffi_modules": ["aiohttp/_vendored/brotlicffi/_build.py:ffi"],
+    }
 
 print("*********************", file=sys.stderr)
 print("* {build_type} build *".format_map(locals()), file=sys.stderr)
