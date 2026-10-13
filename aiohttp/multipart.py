@@ -836,15 +836,14 @@ class MultipartReader:
             raise ValueError(f"Invalid boundary {chunk!r}, expected {self._boundary!r}")
 
     async def _read_headers(self) -> "CIMultiDictProxy[str]":
-        lines = [b""]
+        lines: List[bytes] = []
         while True:
             chunk = await self._content.readline(max_line_length=self._max_field_size)
             chunk = chunk.strip()
             lines.append(chunk)
             if not chunk:
                 break
-            # lines[0] is the empty start-line placeholder skipped by HeadersParser.
-            if len(lines) - 1 > self._max_headers:
+            if len(lines) > self._max_headers:
                 raise BadHttpMessage("Too many headers received")
         parser = HeadersParser(max_field_size=self._max_field_size)
         headers, raw_headers = parser.parse_headers(lines)

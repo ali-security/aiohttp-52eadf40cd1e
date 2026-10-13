@@ -173,8 +173,8 @@ class HeadersParser:
         # note: "raw" does not mean inclusion of OWS before/after the field value
         raw_headers = []
 
-        lines_idx = 1
-        line = lines[1]
+        lines_idx = 0
+        line = lines[lines_idx]
         line_count = len(lines)
 
         while line:
@@ -445,6 +445,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 response_with_body=self.response_with_body,
                                 auto_decompress=self._auto_decompress,
                                 lax=self.lax,
+                                headers_parser=self._headers_parser,
                                 max_line_size=self.max_line_size,
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
@@ -470,6 +471,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 compression=msg.compression,
                                 auto_decompress=self._auto_decompress,
                                 lax=self.lax,
+                                headers_parser=self._headers_parser,
                                 max_line_size=self.max_line_size,
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
@@ -491,6 +493,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 response_with_body=self.response_with_body,
                                 auto_decompress=self._auto_decompress,
                                 lax=self.lax,
+                                headers_parser=self._headers_parser,
                                 max_line_size=self.max_line_size,
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
@@ -540,6 +543,10 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
 
                     eof = True
                     data = b""
+                    if isinstance(
+                        underlying_exc, (InvalidHeader, TransferEncodingError)
+                    ):
+                        raise
 
                 if eof:
                     start_pos = 0
@@ -685,7 +692,7 @@ class HttpRequestParser(HttpParser[RawRequestMessage]):
             compression,
             upgrade,
             chunked,
-        ) = self.parse_headers(lines)
+        ) = self.parse_headers(lines[1:])
 
         if close is None:  # then the headers weren't set in the request
             if version_o <= HttpVersion10:  # HTTP 1.0 must asks to not close
@@ -768,7 +775,7 @@ class HttpResponseParser(HttpParser[RawResponseMessage]):
             compression,
             upgrade,
             chunked,
-        ) = self.parse_headers(lines)
+        ) = self.parse_headers(lines[1:])
 
         if close is None:
             if version_o <= HttpVersion10:
@@ -812,6 +819,7 @@ class HttpPayloadParser:
         auto_decompress: bool = True,
         lax: bool = False,
         *,
+        headers_parser: Optional[HeadersParser] = None,
         max_line_size: int = 8190,
         max_field_size: int = 8190,
         max_trailers: int = 128,
@@ -823,10 +831,15 @@ class HttpPayloadParser:
         self._chunk_tail = b""
         self._auto_decompress = auto_decompress
         self._lax = lax
+        if headers_parser is None:
+            headers_parser = HeadersParser(
+                max_line_size=max_line_size, max_field_size=max_field_size, lax=lax
+            )
+        self._headers_parser = headers_parser
+        self._trailer_lines: List[bytes] = []
         self._max_line_size = max_line_size
         self._max_field_size = max_field_size
         self._max_trailers = max_trailers
-        self._trailer_count = 0
         self.done = False
 
         # payload decompression wrapper
@@ -912,7 +925,7 @@ class HttpPayloadParser:
                             size_b = chunk[:i]  # strip chunk-extensions
                             # Verify no LF in the chunk-extension
                             if b"\n" in (ext := chunk[i:pos]):
-                                exc = BadHttpMessage(
+                                exc = TransferEncodingError(
                                     f"Unexpected LF in chunk-extension: {ext!r}"
                                 )
                                 set_exception(self.payload, exc)
@@ -933,7 +946,7 @@ class HttpPayloadParser:
 
                         chunk = chunk[pos + len(SEP) :]
                         if size == 0:  # eof marker
-                            self._chunk = ChunkState.PARSE_MAYBE_TRAILERS
+                            self._chunk = ChunkState.PARSE_TRAILERS
                             if self._lax and chunk.startswith(b"\r"):
                                 chunk = chunk[1:]
                         else:
@@ -971,48 +984,37 @@ class HttpPayloadParser:
                         self._chunk_tail = chunk
                         return False, b""
 
-                # if stream does not contain trailer, after 0\r\n
-                # we should get another \r\n otherwise
-                # trailers needs to be skipped until \r\n\r\n
-                if self._chunk == ChunkState.PARSE_MAYBE_TRAILERS:
-                    head = chunk[: len(SEP)]
-                    if head == SEP:
-                        # end of stream
-                        self.payload.feed_eof()
-                        return True, chunk[len(SEP) :]
-                    # Both CR and LF, or only LF may not be received yet. It is
-                    # expected that CRLF or LF will be shown at the very first
-                    # byte next time, otherwise trailers should come. The last
-                    # CRLF which marks the end of response might not be
-                    # contained in the same TCP segment which delivered the
-                    # size indicator.
-                    if not head:
-                        return False, b""
-                    if head == SEP[:1]:
-                        self._chunk_tail = head
-                        return False, b""
-                    self._chunk = ChunkState.PARSE_TRAILERS
-
-                # read and discard trailer up to the CRLF terminator
                 if self._chunk == ChunkState.PARSE_TRAILERS:
                     pos = chunk.find(SEP)
-                    if pos >= 0:
-                        line = chunk[:pos]
-                        chunk = chunk[pos + len(SEP) :]
-                        if SEP == b"\n":  # For lax response parsing
-                            line = line.rstrip(b"\r")
-
-                        if len(line) > self._max_field_size:
-                            raise LineTooLong(line[:100] + b"...", self._max_field_size)
-
-                        self._trailer_count += 1
-                        if self._trailer_count > self._max_trailers:
-                            raise BadHttpMessage("Too many trailers received")
-
-                        self._chunk = ChunkState.PARSE_MAYBE_TRAILERS
-                    else:
+                    if pos < 0:  # No line found
                         self._chunk_tail = chunk
                         return False, b""
+
+                    line = chunk[:pos]
+                    chunk = chunk[pos + len(SEP) :]
+                    if SEP == b"\n":  # For lax response parsing
+                        line = line.rstrip(b"\r")
+
+                    if len(line) > self._max_field_size:
+                        raise LineTooLong(line[:100] + b"...", self._max_field_size)
+
+                    self._trailer_lines.append(line)
+                    # The terminating empty line is not a trailer field.
+                    if line and len(self._trailer_lines) > self._max_trailers:
+                        raise BadHttpMessage("Too many trailers received")
+
+                    # \r\n\r\n found, end of stream
+                    if self._trailer_lines[-1] == b"":
+                        # Headers and trailers are defined the same way,
+                        # so we reuse the HeadersParser here.
+                        try:
+                            trailers, raw_trailers = self._headers_parser.parse_headers(
+                                self._trailer_lines
+                            )
+                        finally:
+                            self._trailer_lines.clear()
+                        self.payload.feed_eof()
+                        return True, chunk
 
         # Read all bytes until eof
         elif self._type == ParseState.PARSE_UNTIL_EOF:
