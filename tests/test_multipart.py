@@ -1366,6 +1366,29 @@ async def test_writer_write_no_parts(
     assert b"--:--\r\n" == bytes(buf)
 
 
+@pytest.mark.parametrize(
+    "headers",
+    (
+        {"X-Custom": "value\r\nInjected: evil"},
+        {"X-Custom": "value\nInjected: evil"},
+        {"X-Custom": "value\x00Injected: evil"},
+        {"X-Custom\r\nInjected: evil\r\nX-Other": "value"},
+    ),
+)
+async def test_writer_rejects_part_header_injection(
+    buf: bytearray,
+    stream: AbstractStreamWriter,
+    writer: aiohttp.MultipartWriter,
+    headers: "dict[str, str]",
+) -> None:
+    writer.append("foo-bar-baz", headers)
+    with pytest.raises(ValueError, match="header injection"):
+        await writer.write(stream)
+    with pytest.raises(ValueError, match="header injection"):
+        await writer.as_bytes()
+    assert b"Injected" not in bytes(buf)
+
+
 @pytest.mark.usefixtures("parametrize_zlib_backend")
 async def test_writer_serialize_with_content_encoding_gzip(
     buf: bytearray,
